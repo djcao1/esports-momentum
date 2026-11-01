@@ -1,0 +1,4 @@
+pandas>=2.0
+pyarrow>=14.0
+statsmodels>=0.14
+scikit-learn>=1.3
