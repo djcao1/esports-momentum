@@ -22,7 +22,7 @@ from sklearn.metrics import roc_auc_score
 
 DATA = sys.argv[1] if len(sys.argv) > 1 else "data"
 
-# ---- 1. Load and build one row per round (CT's point of view) --------------
+# 1. Load and build one row per round (CT's point of view)
 maps = pd.read_parquet(f"{DATA}/full_maps.parquet")
 rounds = pd.read_parquet(f"{DATA}/full_rounds.parquet")
 econ = pd.read_parquet(f"{DATA}/full_team_round_economy.parquet")
@@ -54,7 +54,7 @@ counts = df["buy_matchup"].value_counts()
 df["buy_matchup"] = df["buy_matchup"].where(df["buy_matchup"].map(counts) >= 100, "Rare")
 print(f"{len(df):,} non-pistol regulation rounds from {df['map_uid'].nunique():,} maps\n")
 
-# ---- 2. Same train/test split by map as before ------------------------------
+# 2. Same train/test split by map as before
 tr, te = next(GroupShuffleSplit(test_size=0.2, random_state=0).split(df, groups=df["map_uid"]))
 train, test = df.iloc[tr], df.iloc[te]
 
@@ -66,7 +66,7 @@ MODELS = {
     "E  C + ct_won_prev":              "ct_win ~ equip_gap + C(map_name) + C(buy_matchup) + ct_won_prev",
 }
 
-# ---- 3. Fit each model; errors clustered by map ----------------------------
+# 3. Fit each model; errors clustered by map 
 rows, fits = [], {}
 for name, formula in MODELS.items():
     m = smf.logit(formula, data=train).fit(disp=0, maxiter=200, cov_type="cluster",
@@ -78,7 +78,7 @@ for name, formula in MODELS.items():
                  "pseudo R2": round(m.prsquared, 3)})
 print(pd.DataFrame(rows).to_string(index=False))
 
-# ---- 4. Momentum check: ct_won_prev with and without economy ---------------
+# 4. Momentum check: ct_won_prev with and without economy
 print("\nEffect of CT winning the previous round:")
 for name in ["D  ct_won_prev only", "E  C + ct_won_prev"]:
     m = fits[name]
