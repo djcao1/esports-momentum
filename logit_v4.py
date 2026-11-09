@@ -18,6 +18,14 @@ logistic regression. Accuracy, AUC and log loss are averages over the 5 folds.
 Run:  python logit_v4.py data                  (sizes 4-10, about 3,800 subsets)
       python logit_v4.py data --min 1 --max 10 (also sizes 1-3)
       python logit_v4.py data --with-state     (add score difference and loss streaks)
+
+Other model types (optional, after the logistic regression search):
+      python logit_v4.py data --models rf,xgb --gpu            (top 10 subsets per size, on the GPU)
+      python logit_v4.py data --models rf,xgb --gpu --top 25   (top 25 per size)
+      python logit_v4.py data --models rf,xgb --gpu --top all  (every subset: many hours)
+  rf  = random forest (XGBoost's random-forest mode, so it can use the GPU)
+  xgb = XGBoost gradient boosting
+  --gpu needs an NVIDIA GPU; leave it off to run on the CPU.
 """
 import itertools
 import os
@@ -35,11 +43,15 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 args = sys.argv[1:]
-DATA = next((a for a in args if not a.startswith("--") and not a.isdigit()), "data")
+VALUE_FLAGS = {"--min", "--max", "--models", "--top"}
+DATA = next((a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in VALUE_FLAGS)), "data")
 def opt(name, default):
     return int(args[args.index(name) + 1]) if name in args else default
 MIN_K, MAX_K = opt("--min", 4), opt("--max", 10)
 WITH_STATE = "--with-state" in args
+MODELS = next((args[i + 1] for i, a in enumerate(args) if a == "--models"), "")   # e.g. "rf,xgb"
+TOP = next((args[i + 1] for i, a in enumerate(args) if a == "--top"), "10")       # subsets per size, or "all"
+DEVICE = "cuda" if "--gpu" in args else "cpu"
 OUT = "out"
 os.makedirs(OUT, exist_ok=True)
 
@@ -188,7 +200,7 @@ def score(subset):
         acc.append(accuracy_score(yte, p > 0.5)); auc.append(roc_auc_score(yte, p)); ll.append(log_loss(yte, p))
     return {"size": len(subset), "covariates": " + ".join(subset),
             "accuracy": np.mean(acc), "AUC": np.mean(auc), "log loss": np.mean(ll),
-            "accuracy sd": np.std(acc)}
+            "accuracy sd": np.std(acc), "_subset": tuple(subset)}   # _subset: exact names, kept for step 6
 
 
 # =============================================================================
@@ -201,7 +213,7 @@ print(f"{len(NAMES)} candidate covariates, testing all {len(subsets):,} subsets 
 t0 = time.time()
 results = Parallel(n_jobs=-1, batch_size=8)(delayed(score)(s) for s in subsets)
 res = pd.DataFrame(results)
-res.to_csv(f"{OUT}/v4_all_subsets.csv", index=False)
+res.drop(columns="_subset").to_csv(f"{OUT}/v4_all_subsets.csv", index=False)
 print(f"done in {time.time() - t0:.0f}s, saved {OUT}/v4_all_subsets.csv\n")
 
 # =============================================================================
@@ -216,7 +228,7 @@ for metric, asc in [("accuracy", False), ("AUC", False)]:
     print()
 best_acc = res.sort_values("accuracy", ascending=False).groupby("size").head(1).sort_values("size")
 best_auc = res.sort_values("AUC", ascending=False).groupby("size").head(1).sort_values("size")
-best_acc.to_csv(f"{OUT}/v4_best_by_size.csv", index=False)
+best_acc.drop(columns="_subset").to_csv(f"{OUT}/v4_best_by_size.csv", index=False)
 
 # How often each covariate appears in the top 10 subsets of each size (by accuracy)
 top = res.sort_values("accuracy", ascending=False).groupby("size").head(10)
@@ -255,3 +267,68 @@ try:
     print(f"Saved {OUT}/v4_best_by_size.csv, {OUT}/v4_best_by_size.png")
 except ImportError:
     pass
+
+# =============================================================================
+# 6. Optional: random forest and XGBoost on the best subsets
+#    Logistic regression is fast enough to try every subset; these are not, so by
+#    default they run on the top --top subsets of each size from the search above
+#    (ranked by logistic-regression accuracy, plus the best by AUC).
+# =============================================================================
+if MODELS:
+    from xgboost import XGBClassifier, XGBRFClassifier
+
+    def make(model):
+        if model == "xgb":
+            return XGBClassifier(n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8,
+                                 colsample_bytree=0.8, tree_method="hist", device=DEVICE,
+                                 eval_metric="logloss", random_state=0, n_jobs=-1)
+        if model == "rf":
+            return XGBRFClassifier(n_estimators=300, max_depth=8, min_child_weight=10, subsample=0.8,
+                                   colsample_bynode=0.8, tree_method="hist", device=DEVICE,
+                                   random_state=0, n_jobs=-1)
+        raise SystemExit(f"Unknown model '{model}'. Use rf and/or xgb.")
+
+    def score_with(model, subset):
+        idx = [i for n in subset for i in col_idx[n]]
+        acc, auc, ll = [], [], []
+        for Xtr, ytr, Xte, yte in FOLDS:
+            m = make(model).fit(Xtr[:, idx], ytr)
+            p = np.clip(m.predict_proba(Xte[:, idx])[:, 1], 1e-6, 1 - 1e-6)
+            acc.append(accuracy_score(yte, p > 0.5)); auc.append(roc_auc_score(yte, p)); ll.append(log_loss(yte, p))
+        return {"size": len(subset), "covariates": " + ".join(subset),
+                "accuracy": np.mean(acc), "AUC": np.mean(auc), "log loss": np.mean(ll)}
+
+    if TOP == "all":
+        chosen = res
+    else:
+        n = int(TOP)
+        chosen = pd.concat([res.sort_values("accuracy", ascending=False).groupby("size").head(n),
+                            res.sort_values("AUC", ascending=False).groupby("size").head(1)]).drop_duplicates("covariates")
+    chosen_subsets = list(chosen["_subset"])   # exact names (some contain " + ", so never split the text)
+    models = [m.strip() for m in MODELS.split(",") if m.strip()]
+    print(f"\nOTHER MODELS: {', '.join(models)} on {len(chosen_subsets):,} subsets "
+          f"({'all' if TOP == 'all' else 'top ' + TOP + ' per size'}), device = {DEVICE}")
+    rows, t0 = [], time.time()
+    for mi, model in enumerate(models):
+        for j, sub in enumerate(chosen_subsets, 1):
+            r = score_with(model, sub); r["model"] = model; rows.append(r)
+            if j % 10 == 0 or j == len(chosen_subsets):
+                done = mi * len(chosen_subsets) + j
+                left = (time.time() - t0) / done * (len(models) * len(chosen_subsets) - done)
+                print(f"  {model}: {j}/{len(chosen_subsets)} subsets, about {left / 60:.0f} min left", flush=True)
+    other = pd.DataFrame(rows)
+    lr = chosen.assign(model="logistic")[["model", "size", "covariates", "accuracy", "AUC", "log loss"]]
+    allm = pd.concat([lr, other[["model", "size", "covariates", "accuracy", "AUC", "log loss"]]])
+    allm.to_csv(f"{OUT}/v4_models.csv", index=False)
+
+    print("\nBest accuracy at each size, by model (same subsets for every model):")
+    piv = (allm.sort_values("accuracy", ascending=False).groupby(["model", "size"]).head(1)
+           .pivot(index="size", columns="model", values="accuracy") * 100)
+    print(piv.to_string(float_format=lambda v: f"{v:.2f}%"))
+    print("\nBest AUC at each size, by model:")
+    print(allm.sort_values("AUC", ascending=False).groupby(["model", "size"]).head(1)
+          .pivot(index="size", columns="model", values="AUC").to_string(float_format="%.4f"))
+    print("\nBest subset overall for each model (by accuracy):")
+    print(allm.sort_values("accuracy", ascending=False).groupby("model").head(1)
+          [["model", "size", "accuracy", "AUC", "log loss", "covariates"]].to_string(index=False, float_format="%.4f"))
+    print(f"\nSaved {OUT}/v4_models.csv")
